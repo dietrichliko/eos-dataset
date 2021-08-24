@@ -1,0 +1,5 @@
+.env
+.black_venv
+.vscode
+black
+CMSSW_*

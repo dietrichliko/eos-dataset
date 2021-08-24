@@ -1,0 +1,438 @@
+#!/usr/bin/env python
+#
+# Manage CMS User Datasets on EOS Storage
+#
+# Examples:
+#
+#    eos-dataset.py list
+#    eos-dataset.py files
+#    eos-dataset.py verify
+#    eos-dataset.py remove
+#
+# Dietrich Liko, August 2021
+
+from __future__ import print_function
+
+import argparse
+import collections
+import datetime
+import os
+import sys
+import subprocess
+import logging
+import json
+
+from XRootD import client as xrd_client
+
+# include DBS api from crab
+
+CRAB_PROD = "/cvmfs/cms.cern.ch/share/cms/crab-prod"
+latest = sorted(os.listdir(CRAB_PROD))[-1]
+sys.path.insert(0, os.path.join(CRAB_PROD, latest, "lib"))
+
+from dbs.apis.dbsClient import DbsApi
+
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s -  %(message)s", datefmt="%y-%m-%d %H:%M:%S"
+)
+log = logging.getLogger(__name__)
+
+# find binaries
+
+
+def which(name):
+    """shutil.which for python2.7"""
+
+    path = os.getenv("PATH")
+    for p in path.split(os.path.pathsep):
+        p = os.path.join(p, name)
+        if os.path.exists(p) and os.access(p, os.X_OK):
+            return p
+
+    log.fatal("Binary %s not found in PATH.", name)
+    sys.exit(1)
+
+
+VOMS_PROXY_INFO = which("voms-proxy-info")
+CURL = which("curl")
+DASGOCLIENT = which("dasgoclient")
+GETFATTR = which("getfattr")
+
+# prefix for various protocols
+
+PREFIX = {
+    "none": "",
+    "file": "/eos/vbc/experiments/cms",
+    "davs": "davs://eos.grid.vbc.ac.at:8443/eos/vbc/experiments/cms",
+    "root": "root://eos.grid.vbc.ac.at:1094//eos/vbc/experiments/cms",
+    "srm": "srm://se.grid.vbc.ac.at//eos/vbc/experiments/cms",
+    "gridftp": "gsiftp://se.grid.vbc.ac.at:2811/eos/vbc/experiments/cms",
+}
+
+XROOTD_FS = "root://eos.grid.vbc.ac.at:1094"
+
+DBS_URL = "https://cmsweb.cern.ch/dbs/prod/phys03/DBSWriter"
+
+USAGE = """
+eos-dataset command [options]
+
+Commands:
+    list   ... list user datasets
+    files  ... list files for a datset
+    verify ... verify the files of a dataset
+    remove ... remove a dataset
+
+For details on the command
+    eos-dataset <command> --help
+"""
+
+
+def main():
+    """Parse command and call it"""
+
+    parser = argparse.ArgumentParser(
+        description="Manage CMS user Datasets on EOS Storage", usage=USAGE
+    )
+
+    parser.add_argument("command", nargs="?", help="Command to run")
+    args = parser.parse_args(sys.argv[1:2])
+
+    if args.command == "list":
+        list()
+    elif args.command == "files":
+        files()
+    elif args.command == "verify":
+        verify()
+    elif args.command == "remove":
+        remove()
+    else:
+        parser.print_usage()
+
+
+def list():
+    """List datasets from DBS"""
+
+    parser = argparse.ArgumentParser(usage="List user datasets from DBS. The default search pattern for the dataset search is derived from grid username.")
+
+    parser.add_argument(
+        "datasets",
+        metavar="DATASETS",
+        type=str,
+        nargs="?",
+        default=None,
+        help="Dataset patterm",
+    )
+    parser.add_argument("-u", "--user", type=str, default=None, help="alternative grid username")
+    parser.add_argument(
+        "-i", "--instance", type=str, default="prod/phys03", help="DBS instance"
+    )
+    parser.add_argument("-l", "--long", action="store_true", help="long output format")
+    args = parser.parse_args(sys.argv[2:])
+
+    verify_voms_proxy()
+
+    if args.datasets is None:
+        if args.user is None:
+            user = get_user_from_cric()
+        else:
+            user = args.user
+
+        args.datasets = "/*/{}-*/USER".format(user)
+
+    if args.long:
+        print("Last mod time       #Events #Files       Size Type Dataset Name")
+        for dsinfo in das_query_datasets(args.datasets, args.instance):
+            files_info = das_query_files(dsinfo.name, args.instance)
+            size = sum(finfo.size for finfo in files_info)
+            nr_files = len(files_info)
+            nr_events = sum(finfo.events for finfo in files_info)
+
+            print(dsinfo.mtime.strftime("%y-%m-%d %H:%M "), end="")
+            print("{:>12d} ".format(nr_events), end="")
+            print("{:>6d} ".format(nr_files), end="")
+            print("{:>10s} ".format(bytes_to_human_readable(size)), end="")
+            print("{:>4s} ".format(dsinfo.datatype), end="")
+            print(dsinfo.name)
+
+    else:
+        for dsinfo in das_query_datasets(args.datasets, args.instance):
+            print(dsinfo.mtime.strftime("%y-%m-%d %H:%M "), end="")
+            print("{:>4s} ".format(dsinfo.datatype), end="")
+            print(dsinfo.name)
+
+
+def files():
+    """List files of a dataset"""
+
+    parser = argparse.ArgumentParser(usage="List files of a dataset. By providing the")
+
+    parser.add_argument(
+        "dataset", metavar="DATASET", type=str, default=None, help="Dataset patterm"
+    )
+
+    parser.add_argument(
+        "-i", "--instance", type=str, default="prod/phys03", help="DBS instance"
+    )
+    parser.add_argument("-l", "--long", action="store_true", help="Long output format")
+    parser.add_argument(
+        "-p", "--protocol", choices=PREFIX.keys(), default="root", help="URL protocols"
+    )
+    args = parser.parse_args(sys.argv[2:])
+
+    verify_voms_proxy()
+
+    if args.long:
+        print("  Type #Events       Size Checksum URL")
+        for file in das_query_files(args.dataset, args.instance):
+            print(
+                "{:>6} {:>7}  {:>10s}  {:08X}  {}{}".format(
+                    file.type,
+                    file.events,
+                    bytes_to_human_readable(file.size),
+                    file.checksum,
+                    PREFIX[args.protocol],
+                    file.name,
+                )
+            )
+    else:
+        for file in das_query_files(args.dataset, args.instance):
+            print(PREFIX[args.protocol] + file.name)
+
+
+def verify():
+    """Verify files of a dataset"""
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "dataset", metavar="DATASET", type=str, default=None, help="Dataset patterm"
+    )
+
+    parser.add_argument(
+        "-i", "--instance", type=str, default="prod/phys03", help="DBS instance"
+    )
+    parser.add_argument(
+        "-c", "--checksum", action="store_true", help="Long output format"
+    )
+    args = parser.parse_args(sys.argv[2:])
+
+    verify_voms_proxy()
+
+    for file in das_query_files(args.dataset, args.instance):
+        path = PREFIX["file"] + file.name
+        try:
+            statinfo = os.stat(path)
+        except OSError as err:
+            if err.errno == 2:
+                print("Does not exists - {}".format(file.name))
+            else:
+                print("{!s} = {}".format(err, file.name))
+            continue
+
+        if statinfo.st_size != file.size:
+            print("Size mismatch - {}".format(file.name))
+            continue
+
+        if args.checksum:
+            eos_checksum = int(getxattr(path, "eos.checksum"), 16)
+            if eos_checksum != file.checksum:
+                print("Checksum mismatch - {}".format(file.name), fg="white")
+                continue
+
+        print("OK - {}".format(file.name))
+
+
+def remove():
+    """remove dataset"""
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "dataset", metavar="DATASET", type=str, default=None, help="Dataset patterm"
+    )
+    parser.add_argument(
+        "-i", "--instance", type=str, default="prod/phys03", help="DBS instance"
+    )
+    args = parser.parse_args(sys.argv[2:])
+
+    verify_voms_proxy()
+
+    xrd_fs = xrd_client.FileSystem(XROOTD_FS)
+
+    for file in das_query_files(args.dataset, args.instance):
+        path = PREFIX["file"] + file.name
+        rc = xrd_fs.rm(path)
+        if rc[0].ok:
+            print("File {} removed.".format(file.name))
+        else:
+            print(rc[0])
+
+    dbs_api = DbsApi(url=DBS_URL)
+
+    dbs_api.updateFileStatus(is_file_valid=0, dataset=args.dataset)
+    dbs_api.updateDatasetType(dataset=args.dataset, dataset_access_type="DELETED")
+
+    print("Datset has been marked deleted in the DB")
+
+
+def verify_voms_proxy(vo="cms", valid=1, rfc=True):
+    """Verify the existence, the validity and attributes of the VOMS proxy"""
+
+    cmd = [VOMS_PROXY_INFO, "-type", "-vo", "-timeleft"]
+
+    try:
+        output = subprocess.check_output(cmd).splitlines()
+    except subprocess.CalledProcessError as exc:
+        log.fatal("Error %d from voms-proxy-info.\n%s", exc.returncode, exc.output)
+        sys.exit(1)
+
+    if rfc and not output[0].startswith("RFC3820 "):
+        log.fatal("VOMS proxy is not RFC3820 complient.")
+        sys.exit(1)
+    hours = float(output[1].rstrip()) / 3600
+    if hours < valid:
+        log.fatal("VOMS proxy has only %3.1f hours left.", hours)
+        sys.exit(1)
+    if output[2].rstrip() != vo:
+        log.fatal("VOMS proxy has wrong VO %s.", output[3].rstrip())
+        sys.exit(1)
+
+    log.debug("VOMS proxy is valid for %6.2f hours.", hours)
+
+
+def get_user_from_cric():
+    """Get the username matched to certificate from the CMS cric DB"""
+
+    capath = os.getenv("X509_CERT_DIR", "/etc/grid-security/certificates")
+    proxy = os.getenv("X509_USER_PROXY", "/tmp/x509up_u{}".format(os.getuid()))
+    cmd = [
+        CURL,
+        "-sS",
+        "--capath",
+        capath,
+        "--cert",
+        proxy,
+        "--key",
+        proxy,
+        "https://cms-cric.cern.ch/api/accounts/user/query/?json&preset=whoami",
+    ]
+
+    try:
+        output = subprocess.check_output(cmd)
+        gridname = json.loads(output)["result"][0]["login"]
+    except subprocess.CalledProcessError as err:
+        log.error("Error from calling curl: %s", err)
+        gridname = ""
+    except KeyError:
+        log.error("Json response from curl is invalid")
+        gridname = ""
+
+    return gridname
+
+
+DatasetInfo = collections.namedtuple(
+    "DatasetInfo", ["name", "primary_ds_name", "datatype", "ctime", "mtime"]
+)
+
+
+def das_query_datasets(datasets, instance):
+
+    cmd = [
+        DASGOCLIENT,
+        "--json",
+        "--query=datasets dataset={} instance={}".format(datasets, instance),
+    ]
+
+    try:
+        output = subprocess.check_output(cmd)
+        data = json.loads(output)
+    except subprocess.CalledProcessError as err:
+        log.error("Error from calling curl: %s", err)
+        return []
+
+    try:
+        datasets_info = []
+        for d in data:
+            for ds in d["dataset"]:
+                datasets_info.append(
+                    DatasetInfo(
+                        ds["name"],
+                        ds["primary_ds_name"],
+                        ds["datatype"],
+                        datetime.datetime.fromtimestamp(ds["creation_time"]),
+                        datetime.datetime.fromtimestamp(ds["modification_time"]),
+                    )
+                )
+        return datasets_info
+
+    except KeyError:
+        log.error("Cannot parse json structure")
+        return []
+
+
+FileInfo = collections.namedtuple(
+    "FileInfo", ["name", "mtime", "type", "events", "size", "checksum"]
+)
+
+
+def das_query_files(dataset, instance):
+
+    cmd = [
+        DASGOCLIENT,
+        "--json",
+        "--query=file dataset={} instance={}".format(dataset, instance),
+    ]
+
+    try:
+        output = subprocess.check_output(cmd)
+        data = json.loads(output)
+    except subprocess.CalledProcessError as err:
+        log.error("Error from calling curl: %s", err)
+        return []
+
+    try:
+        file_infos = []
+        for d in data:
+            for f in d["file"]:
+                file_infos.append(
+                    FileInfo(
+                        f["name"],
+                        datetime.datetime.fromtimestamp(f["modification_time"]),
+                        f["type"],
+                        int(f["nevents"]),
+                        int(f["size"]),
+                        int(f["adler32"], 16),
+                    )
+                )
+        return file_infos
+    except KeyError as err:
+        log.error("Cannot parse json structure %s", err)
+        return []
+
+
+def bytes_to_human_readable(size, decimal_places=2):
+    """Convert size in bytes to human readable string
+
+    https://stackoverflow.com/questions/1094841/get-human-readable-version-of-file-size
+    """
+    for unit in ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]:
+        if size < 1024.0 or unit == "PiB":
+            break
+        size /= 1024.0
+    return "{:.{}f} {}".format(size, decimal_places, unit)
+
+
+def getxattr(path, name):
+    """read xtenden file attribute"""
+
+    cmd = [GETFATTR, "--only-values", "--absolute-names", "-n", name, path]
+
+    try:
+        output = subprocess.check_output(cmd)
+        return output.strip()
+    except subprocess.CalledProcessError as err:
+        log.error("Error from calling getfattr: %s", err)
+        return []
+
+
+if __name__ == "__main__":
+
+    main()
